@@ -448,6 +448,35 @@ GREEN_BG = "background-color: #0d3b1e; color: #6bff9e"
 RED_BG   = "background-color: #3b0d0d; color: #ff6b6b"
 MID_BG   = ""
 
+# ─── Stock Screener universe ──────────────────────────────────────────────────
+
+STOCK_UNIVERSE = list(dict.fromkeys([
+    # Tech / Semis
+    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AVGO","ORCL","CRM",
+    "ADBE","AMD","QCOM","INTC","TXN","AMAT","MU","LRCX","KLAC","MRVL",
+    "NOW","SNPS","CDNS","PANW","CRWD","SNOW","PLTR","DDOG","ZS","FTNT",
+    # Financials
+    "JPM","BAC","WFC","GS","MS","BLK","V","MA","AXP","C","COF","SPGI","MCO",
+    # Healthcare
+    "JNJ","UNH","PFE","ABBV","MRK","ABT","TMO","DHR","CVS","CI","ISRG","GILD","LLY",
+    # Consumer Discretionary
+    "HD","WMT","COST","TGT","MCD","SBUX","NKE","TJX","LOW","BKNG","DG","AMZN",
+    # Energy
+    "XOM","CVX","COP","EOG","SLB","PSX","MPC","VLO","OXY",
+    # Industrials
+    "CAT","DE","HON","RTX","LMT","GE","BA","UPS","FDX","EMR","PH","ITW",
+    # Communication / Media
+    "DIS","NFLX","CMCSA","T","VZ","TMUS",
+    # Utilities / REITs
+    "NEE","DUK","SO","AMT","PLD","EQIX",
+    # Consumer Staples
+    "PG","KO","PEP","PM","MO","CL","GIS",
+    # Materials
+    "LIN","APD","NEM","FCX",
+    # Growth / Other
+    "COIN","UBER","ABNB","SHOP","SQ","TTD","RBLX","BRK-B","BX","KKR","MSCI",
+]))
+
 
 def build_comparison_df(metrics_list, section_rows):
     """
@@ -863,6 +892,513 @@ def render_compare(api_key):
                 st.error(f"AI analysis failed: {e}")
 
 
+# ─── Screener scoring helpers ────────────────────────────────────────────────
+
+def _ts(val, breakpoints, scores, na=10):
+    """Tier-score: breakpoints descending; returns matching score or 0 if below all."""
+    if val is None:
+        return na
+    for bp, sc in zip(breakpoints, scores):
+        if val >= bp:
+            return sc
+    return 0
+
+
+def score_growth_topline(info):
+    """0-100: future topline growth potential."""
+    s = 0
+    # 1. Revenue growth YoY
+    s += _ts(safe_float(info.get("revenueGrowth")),
+             [0.30, 0.20, 0.10, 0.05, 0.0], [25, 20, 15, 10, 5], na=10)
+    # 2. Earnings growth
+    s += _ts(safe_float(info.get("earningsGrowth")),
+             [0.30, 0.20, 0.10, 0.0], [25, 20, 15, 8], na=10)
+    # 3. Forward P/E < Trailing P/E → earnings expected to grow
+    pe_t = safe_float(info.get("trailingPE"))
+    pe_f = safe_float(info.get("forwardPE"))
+    if pe_t and pe_f and pe_t > 0 and pe_f > 0:
+        ratio = pe_f / pe_t
+        if ratio < 0.80:   s += 25
+        elif ratio < 0.90: s += 20
+        elif ratio < 1.00: s += 15
+        elif ratio < 1.10: s += 8
+        else:              s += 3
+    else:
+        s += 10
+    # 4. Analyst price-target upside
+    price  = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    target = safe_float(info.get("targetMeanPrice"))
+    if price and target and price > 0:
+        upside = (target - price) / price
+        s += _ts(upside, [0.30, 0.20, 0.10, 0.05, 0.0], [25, 20, 15, 10, 5], na=10)
+    else:
+        s += 10
+    return min(100, s)
+
+
+def score_bottom_line(info):
+    """0-100: current profitability."""
+    s = 0
+    s += _ts(safe_float(info.get("profitMargins")),
+             [0.25, 0.15, 0.08, 0.03, 0.0], [25, 20, 15, 10, 5], na=8)
+    s += _ts(safe_float(info.get("returnOnEquity")),
+             [0.25, 0.15, 0.10, 0.05, 0.0], [25, 20, 15, 10, 5], na=8)
+    s += _ts(safe_float(info.get("operatingMargins")),
+             [0.25, 0.15, 0.08, 0.03, 0.0], [25, 20, 15, 10, 5], na=8)
+    s += _ts(safe_float(info.get("returnOnAssets")),
+             [0.12, 0.08, 0.05, 0.02, 0.0], [25, 20, 15, 10, 5], na=8)
+    return min(100, s)
+
+
+def score_mgmt_debt_risk(info):
+    """0-100: management quality, low debt, financial stability."""
+    s = 0
+    # Debt-to-equity (lower = better)
+    d2e = safe_float(info.get("debtToEquity"))
+    if d2e is not None:
+        if d2e < 50:   s += 25
+        elif d2e < 100: s += 20
+        elif d2e < 150: s += 15
+        elif d2e < 250: s += 8
+        else:           s += 3
+    else:
+        s += 15  # many high-quality companies carry zero debt
+    s += _ts(safe_float(info.get("currentRatio")),
+             [2.5, 1.5, 1.0, 0.5], [25, 20, 15, 8], na=12)
+    # FCF yield = FCF / Market Cap
+    fcf    = safe_float(info.get("freeCashflow"))
+    mktcap = safe_float(info.get("marketCap"))
+    if fcf and mktcap and mktcap > 0:
+        s += _ts(fcf / mktcap, [0.05, 0.03, 0.01, 0.0], [25, 20, 15, 8], na=8)
+    else:
+        s += 8
+    s += _ts(safe_float(info.get("quickRatio")),
+             [2.0, 1.5, 1.0, 0.5], [25, 20, 15, 8], na=12)
+    return min(100, s)
+
+
+def _calc_rsi(prices, period=14):
+    delta = prices.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def score_momentum(four_wk_return, info, hist):
+    """0-100: price momentum and technical signals."""
+    s = 0
+    # 1. 4-week return
+    r = four_wk_return
+    if r is not None:
+        if r > 10:   s += 25
+        elif r > 5:  s += 20
+        elif r > 2:  s += 15
+        elif r > 0:  s += 10
+        elif r > -2: s += 6
+        elif r > -5: s += 3
+    else:
+        s += 8
+    # 2. Price vs 50-day MA
+    price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    ma50  = safe_float(info.get("fiftyDayAverage"))
+    if price and ma50 and ma50 > 0:
+        vs50 = (price - ma50) / ma50 * 100
+        if vs50 > 8:   s += 25
+        elif vs50 > 3: s += 20
+        elif vs50 > 0: s += 15
+        elif vs50 > -3: s += 8
+        else:           s += 3
+    else:
+        s += 10
+    # 3. Price vs 200-day MA
+    ma200 = safe_float(info.get("twoHundredDayAverage"))
+    if price and ma200 and ma200 > 0:
+        vs200 = (price - ma200) / ma200 * 100
+        if vs200 > 15:  s += 25
+        elif vs200 > 8: s += 20
+        elif vs200 > 0: s += 15
+        elif vs200 > -8: s += 8
+        else:            s += 3
+    else:
+        s += 10
+    # 4. RSI(14) — sweet spot is 50-65 (trending up, not overbought)
+    rsi_val = None
+    if hist is not None and not hist.empty and len(hist) >= 20:
+        try:
+            rsi_s = _calc_rsi(hist["Close"])
+            valid = rsi_s.dropna()
+            if not valid.empty:
+                rsi_val = float(valid.iloc[-1])
+        except Exception:
+            pass
+    if rsi_val is not None:
+        if 55 <= rsi_val <= 65:  s += 25
+        elif 50 <= rsi_val < 55: s += 20
+        elif 65 < rsi_val <= 70: s += 18
+        elif 45 <= rsi_val < 50: s += 12
+        elif 70 < rsi_val <= 80: s += 8
+        elif 35 <= rsi_val < 45: s += 8
+        elif rsi_val > 80:       s += 3
+        elif 25 <= rsi_val < 35: s += 5
+        else:                    s += 2
+    else:
+        s += 10
+    return min(100, s)
+
+
+def composite_score_val(g, b, m, mom):
+    return round(0.25 * g + 0.25 * b + 0.25 * m + 0.25 * mom, 1)
+
+
+def score_label(score):
+    if score >= 80: return "Strong Buy"
+    if score >= 65: return "Buy"
+    if score >= 50: return "Hold"
+    if score >= 35: return "Caution"
+    return "Avoid"
+
+
+def score_badge(score):
+    if score >= 80: return "🟢"
+    if score >= 65: return "🟩"
+    if score >= 50: return "🟡"
+    if score >= 35: return "🟠"
+    return "🔴"
+
+
+# ─── Screener data fetchers ───────────────────────────────────────────────────
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_universe_4week_returns(tickers_tuple):
+    """Batch-download ~5 weeks of prices; return {sym: 4w_pct_return}."""
+    tickers = list(tickers_tuple)
+    end   = datetime.now()
+    start = end - timedelta(weeks=5)
+    results = {}
+    try:
+        raw = yf.download(
+            tickers,
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if raw.empty:
+            return results
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": tickers[0]})
+        for sym in tickers:
+            try:
+                if sym in close.columns:
+                    prices = close[sym].dropna()
+                    if len(prices) >= 2:
+                        results[sym] = float(
+                            (prices.iloc[-1] - prices.iloc[0]) / prices.iloc[0] * 100
+                        )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return results
+
+
+def _get_rsi_macd(hist):
+    """Return (rsi_float_or_None, 'Bullish'|'Bearish'|None)."""
+    if hist is None or hist.empty or len(hist) < 30:
+        return None, None
+    rsi_val = None
+    macd_sig = None
+    try:
+        rsi_s = _calc_rsi(hist["Close"])
+        valid = rsi_s.dropna()
+        if not valid.empty:
+            rsi_val = float(valid.iloc[-1])
+    except Exception:
+        pass
+    try:
+        ema12 = hist["Close"].ewm(span=12).mean()
+        ema26 = hist["Close"].ewm(span=26).mean()
+        macd  = ema12 - ema26
+        sig   = macd.ewm(span=9).mean()
+        macd_sig = "Bullish" if (macd - sig).iloc[-1] > 0 else "Bearish"
+    except Exception:
+        pass
+    return rsi_val, macd_sig
+
+
+# ─── Screener renderer ────────────────────────────────────────────────────────
+
+def _build_screener_df(data):
+    display = data.copy()
+    display["4W Ret%"] = display["_4w"].apply(
+        lambda r: f"{r:+.2f}%" if r is not None else "N/A"
+    )
+    display["RSI"] = display["_rsi"].apply(
+        lambda r: f"{r:.0f} ({'OB' if r > 70 else ('OS' if r < 30 else 'OK')})"
+        if r is not None else "N/A"
+    )
+    display["Rec"] = display["Score"].apply(
+        lambda s: f"{score_badge(s)} {score_label(s)}"
+    )
+    display["YF"] = display["Symbol"].apply(
+        lambda s: f"https://finance.yahoo.com/quote/{s}"
+    )
+    cols = ["Symbol", "YF", "Price", "Sector", "4W Ret%",
+            "Growth", "Profit", "Mgmt/Debt", "Momentum", "Score",
+            "Rec", "RSI", "MACD", "MA Signal"]
+    return display[cols].reset_index(drop=True)
+
+
+def _show_screener_table(data, key, height):
+    df = _build_screener_df(data)
+    notes_store = st.session_state.get("screener_notes", {})
+    df["Notes"] = df["Symbol"].map(lambda s: notes_store.get(s, ""))
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        height=height,
+        key=key,
+        column_config={
+            "Symbol":    st.column_config.TextColumn("Ticker", width="small", disabled=True),
+            "YF":        st.column_config.LinkColumn("Yahoo Finance", display_text="📊 Open", width="small"),
+            "Price":     st.column_config.TextColumn("Price", width="small", disabled=True),
+            "Sector":    st.column_config.TextColumn("Sector", disabled=True),
+            "4W Ret%":   st.column_config.TextColumn("4W Ret%", width="small", disabled=True),
+            "Growth":    st.column_config.ProgressColumn("Growth",    min_value=0, max_value=100, format="%.0f"),
+            "Profit":    st.column_config.ProgressColumn("Profit",    min_value=0, max_value=100, format="%.0f"),
+            "Mgmt/Debt": st.column_config.ProgressColumn("Mgmt/Debt", min_value=0, max_value=100, format="%.0f"),
+            "Momentum":  st.column_config.ProgressColumn("Momentum",  min_value=0, max_value=100, format="%.0f"),
+            "Score":     st.column_config.ProgressColumn("Score",     min_value=0, max_value=100, format="%.0f"),
+            "Rec":       st.column_config.TextColumn("Signal",    disabled=True),
+            "RSI":       st.column_config.TextColumn("RSI",       width="small", disabled=True),
+            "MACD":      st.column_config.TextColumn("MACD",      width="small", disabled=True),
+            "MA Signal": st.column_config.TextColumn("MA Signal", disabled=True),
+            "Notes":     st.column_config.TextColumn("📝 Notes / Actions", width="large"),
+        },
+        hide_index=True,
+    )
+
+    updated = dict(zip(edited["Symbol"], edited["Notes"]))
+    st.session_state["screener_notes"] = {**notes_store, **updated}
+
+
+import pickle as _pickle
+
+_SCREENER_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_cache.pkl")
+
+
+def _load_screener_cache():
+    try:
+        if os.path.exists(_SCREENER_CACHE_FILE):
+            with open(_SCREENER_CACHE_FILE, "rb") as f:
+                data = _pickle.load(f)
+            return data.get("rows"), data.get("timestamp")
+    except Exception:
+        pass
+    return None, None
+
+
+def _save_screener_cache(rows, timestamp):
+    try:
+        with open(_SCREENER_CACHE_FILE, "wb") as f:
+            _pickle.dump({"rows": rows, "timestamp": timestamp}, f)
+    except Exception:
+        pass
+
+
+def _clear_screener_cache():
+    try:
+        if os.path.exists(_SCREENER_CACHE_FILE):
+            os.remove(_SCREENER_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def render_screener():
+    st.markdown(
+        "Scans **~120 popular stocks** to find the **top 20 gainers** and "
+        "**bottom 20 losers** over the last 4 weeks, then scores each on four "
+        "equal-weight pillars."
+    )
+
+    # Load disk cache into session state on first visit this session
+    if "screener_rows" not in st.session_state:
+        cached_rows, cached_ts = _load_screener_cache()
+        if cached_rows is not None:
+            st.session_state["screener_rows"]     = cached_rows
+            st.session_state["screener_cache_ts"] = cached_ts
+
+    col_btn, col_clear, col_hint = st.columns([1, 1, 3])
+    run_btn   = col_btn.button("▶ Run Screener",  type="primary",
+                               use_container_width=True, key="screener_run")
+    clear_btn = col_clear.button("🗑 Clear Cache", use_container_width=True,
+                                 key="screener_clear")
+    col_hint.caption(
+        "⏱ First run ~90 s · Results cached to disk indefinitely · "
+        "Scoring: 25% Future Growth  ·  25% Profitability  ·  25% Mgmt/Debt  ·  25% Momentum"
+    )
+
+    if clear_btn:
+        _clear_screener_cache()
+        st.session_state.pop("screener_rows", None)
+        st.session_state.pop("screener_cache_ts", None)
+        st.rerun()
+
+    if not run_btn and "screener_rows" not in st.session_state:
+        c = st.columns(4)
+        c[0].info("**📈 Growth (25%)**\nRevenue growth · EPS growth · Fwd vs trailing P/E · Analyst upside")
+        c[1].info("**💰 Profitability (25%)**\nNet margin · ROE · Operating margin · ROA")
+        c[2].info("**🛡 Mgmt / Debt (25%)**\nDebt-to-equity · Current ratio · FCF yield · Quick ratio")
+        c[3].info("**⚡ Momentum (25%)**\n4-week return · vs 50d MA · vs 200d MA · RSI(14)")
+        return
+
+    if run_btn:
+        st.session_state.pop("screener_rows", None)
+        st.session_state.pop("screener_cache_ts", None)
+
+    if "screener_rows" not in st.session_state:
+        tickers_tuple = tuple(sorted(STOCK_UNIVERSE))
+
+        prog = st.progress(0, text="Fetching 4-week returns for universe…")
+        returns = fetch_universe_4week_returns(tickers_tuple)
+
+        if not returns:
+            st.error("Could not download price data. Check internet connection.")
+            return
+
+        sorted_rets = sorted(returns.items(), key=lambda x: x[1], reverse=True)
+        n = min(20, len(sorted_rets) // 2)
+        top20    = [s for s, _ in sorted_rets[:n]]
+        bottom20 = [s for s, _ in sorted_rets[-n:]]
+        candidates = list(dict.fromkeys(top20 + bottom20))
+
+        prog.progress(0.12, text=f"Identified {len(candidates)} candidates · Fetching fundamentals…")
+
+        rows = []
+        for i, sym in enumerate(candidates):
+            prog.progress(
+                0.12 + 0.85 * (i / len(candidates)),
+                text=f"Analyzing {sym}  ({i+1}/{len(candidates)})…",
+            )
+            try:
+                info, fin, bs, cf, hist, ed = fetch_data(sym)
+                if info is None:
+                    continue
+                four_wk = returns.get(sym)
+
+                g   = score_growth_topline(info)
+                b   = score_bottom_line(info)
+                md  = score_mgmt_debt_risk(info)
+                mom = score_momentum(four_wk, info, hist)
+                comp = composite_score_val(g, b, md, mom)
+
+                rsi_val, macd_sig = _get_rsi_macd(hist)
+
+                price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+                ma50  = safe_float(info.get("fiftyDayAverage"))
+                ma200 = safe_float(info.get("twoHundredDayAverage"))
+                vs50  = (price - ma50)  / ma50  * 100 if price and ma50  else None
+                vs200 = (price - ma200) / ma200 * 100 if price and ma200 else None
+
+                ma_parts = []
+                if vs50  is not None: ma_parts.append(f"{'↑' if vs50  > 0 else '↓'} 50d ({vs50:+.1f}%)")
+                if vs200 is not None: ma_parts.append(f"{'↑' if vs200 > 0 else '↓'} 200d ({vs200:+.1f}%)")
+
+                rows.append({
+                    "Symbol":    sym,
+                    "Name":      (info.get("longName", sym) or sym)[:28],
+                    "Price":     f"${price:.2f}" if price else "N/A",
+                    "Sector":    info.get("sector", "N/A"),
+                    "_4w":       four_wk,
+                    "Growth":    round(g,   1),
+                    "Profit":    round(b,   1),
+                    "Mgmt/Debt": round(md,  1),
+                    "Momentum":  round(mom, 1),
+                    "Score":     comp,
+                    "_rsi":      rsi_val,
+                    "MACD":      macd_sig or "N/A",
+                    "MA Signal": " | ".join(ma_parts) if ma_parts else "N/A",
+                    "_group":    "Top 20" if sym in top20 else "Bottom 20",
+                })
+            except Exception:
+                continue
+
+        prog.progress(1.0, text="Done!")
+        prog.empty()
+
+        if not rows:
+            st.error("No data fetched. Try again in a moment.")
+            return
+
+        now = datetime.now()
+        st.session_state["screener_rows"]     = rows
+        st.session_state["screener_cache_ts"] = now
+        _save_screener_cache(rows, now)
+
+    # ── Cache age warning ─────────────────────────────────────────────────────
+    ts = st.session_state.get("screener_cache_ts")
+    if ts:
+        age   = datetime.now() - ts
+        total = int(age.total_seconds())
+        days  = total // 86400
+        hours = (total % 86400) // 3600
+        mins  = (total % 3600)  // 60
+        parts = []
+        if days:  parts.append(f"{days}d")
+        if hours: parts.append(f"{hours}h")
+        parts.append(f"{mins}m")
+        st.warning(
+            f"⚠️ Data cached on **{ts.strftime('%Y-%m-%d %H:%M')}** "
+            f"({' '.join(parts)} ago). Prices and scores may be stale. "
+            "Click **▶ Run Screener** to refresh or **🗑 Clear Cache** to reset."
+        )
+
+    rows = st.session_state["screener_rows"]
+    df   = pd.DataFrame(rows)
+
+    top_df = df[df["_group"] == "Top 20"].sort_values("Score", ascending=False)
+    bot_df = df[df["_group"] == "Bottom 20"].sort_values("Score", ascending=False)
+
+    # ── Top 20 section ──
+    st.markdown("---")
+    st.markdown("## 🚀 Top 20 Gainers — Last 4 Weeks")
+    st.caption("Sorted by composite recommendation score (highest = strongest fundamentals)")
+    if not top_df.empty:
+        _show_screener_table(top_df, key="screener_top", height=560)
+    else:
+        st.info("No top-gainer data.")
+
+    # ── Bottom 20 section ──
+    st.markdown("---")
+    st.markdown("## 📉 Bottom 20 Losers — Last 4 Weeks")
+    st.caption("High score here may signal an oversold buying opportunity; low score confirms weakness")
+    if not bot_df.empty:
+        _show_screener_table(bot_df, key="screener_bot", height=560)
+    else:
+        st.info("No bottom-loser data.")
+
+    # ── Combined all 40, sorted by score ──
+    st.markdown("---")
+    st.markdown("## 📊 All Candidates — Ranked by Score")
+    all_sorted = df.sort_values("Score", ascending=False)
+    _show_screener_table(all_sorted, key="screener_all", height=900)
+
+    # ── Score legend ──
+    st.markdown("---")
+    lc = st.columns(5)
+    lc[0].success("🟢 Strong Buy ≥ 80")
+    lc[1].success("🟩 Buy ≥ 65")
+    lc[2].warning("🟡 Hold ≥ 50")
+    lc[3].warning("🟠 Caution ≥ 35")
+    lc[4].error("🔴 Avoid < 35")
+    st.caption(
+        "RSI: OB = Overbought (>70) · OS = Oversold (<30) · OK = Neutral  |  "
+        "MACD: Bullish = MACD above signal line  |  Not financial advice."
+    )
+
+
 # ─── App shell ────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Stock Analysis", page_icon="📈", layout="wide")
@@ -888,7 +1424,7 @@ with st.sidebar:
     st.divider()
     st.caption("Data cached 10 min · Moat is a proxy metric · Not financial advice")
 
-tab_single, tab_compare = st.tabs(["Single Stock", "Compare 3 Stocks"])
+tab_single, tab_compare, tab_screener = st.tabs(["Single Stock", "Compare 3 Stocks", "Stock Screener"])
 
 # ── Single Stock tab ──────────────────────────────────────────────────────────
 with tab_single:
@@ -915,3 +1451,7 @@ with tab_single:
 # ── Compare tab ───────────────────────────────────────────────────────────────
 with tab_compare:
     render_compare(api_key_input)
+
+# ── Screener tab ──────────────────────────────────────────────────────────────
+with tab_screener:
+    render_screener()

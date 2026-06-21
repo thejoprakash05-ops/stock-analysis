@@ -15,6 +15,9 @@ env/
 *.jpg
 *.jpeg
 
+# Cache
+screener_cache.pkl
+
 # OS
 .DS_Store
 Thumbs.db
