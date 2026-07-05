@@ -55,6 +55,22 @@ def safe_float(val):
         return None
 
 
+def calc_period_returns(hist):
+    """Return % price change for standard lookback periods from a 1-year history DataFrame."""
+    if hist is None or hist.empty:
+        return {k: None for k in ["1d", "5d", "1m", "3m", "6m", "1y"]}
+    prices = hist["Close"].dropna()
+    if len(prices) < 2:
+        return {k: None for k in ["1d", "5d", "1m", "3m", "6m", "1y"]}
+    last = float(prices.iloc[-1])
+    def _ret(n):
+        if len(prices) <= n:
+            return None
+        prev = float(prices.iloc[-n - 1])
+        return (last - prev) / prev * 100 if prev != 0 else None
+    return {"1d": _ret(1), "5d": _ret(5), "1m": _ret(21), "3m": _ret(63), "6m": _ret(126), "1y": _ret(251)}
+
+
 # ─── Derived metric calculations ──────────────────────────────────────────────
 
 def calc_roic(financials, balance_sheet):
@@ -450,17 +466,26 @@ MID_BG   = ""
 
 # ─── Stock Screener universe ──────────────────────────────────────────────────
 
-STOCK_UNIVERSE = list(dict.fromkeys([
-    # Tech / Semis
-    "AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","AVGO","ORCL","CRM",
-    "ADBE","AMD","QCOM","INTC","TXN","AMAT","MU","LRCX","KLAC","MRVL",
-    "NOW","SNPS","CDNS","PANW","CRWD","SNOW","PLTR","DDOG","ZS","FTNT",
+AI_UNIVERSE = list(dict.fromkeys([
+    # AI Chips & Hardware
+    "NVDA","AMD","AVGO","INTC","QCOM","AMAT","MU","LRCX","KLAC","MRVL","TXN",
+    # Big Tech (AI-core)
+    "MSFT","GOOGL","META","AMZN","AAPL",
+    # AI Cloud & Software
+    "ORCL","CRM","ADBE","NOW","SNPS","CDNS","SNOW","PLTR","DDOG",
+    # Cybersecurity (AI-driven)
+    "PANW","CRWD","ZS","FTNT",
+    # AI-adjacent
+    "TSLA","TTD","SHOP","COIN","SQ",
+]))
+
+NON_AI_UNIVERSE = list(dict.fromkeys([
     # Financials
     "JPM","BAC","WFC","GS","MS","BLK","V","MA","AXP","C","COF","SPGI","MCO",
     # Healthcare
     "JNJ","UNH","PFE","ABBV","MRK","ABT","TMO","DHR","CVS","CI","ISRG","GILD","LLY",
     # Consumer Discretionary
-    "HD","WMT","COST","TGT","MCD","SBUX","NKE","TJX","LOW","BKNG","DG","AMZN",
+    "HD","WMT","COST","TGT","MCD","SBUX","NKE","TJX","LOW","BKNG","DG",
     # Energy
     "XOM","CVX","COP","EOG","SLB","PSX","MPC","VLO","OXY",
     # Industrials
@@ -473,9 +498,11 @@ STOCK_UNIVERSE = list(dict.fromkeys([
     "PG","KO","PEP","PM","MO","CL","GIS",
     # Materials
     "LIN","APD","NEM","FCX",
-    # Growth / Other
-    "COIN","UBER","ABNB","SHOP","SQ","TTD","RBLX","BRK-B","BX","KKR","MSCI",
+    # Other
+    "UBER","ABNB","RBLX","BRK-B","BX","KKR","MSCI",
 ]))
+
+STOCK_UNIVERSE = list(dict.fromkeys(AI_UNIVERSE + NON_AI_UNIVERSE))
 
 
 def build_comparison_df(metrics_list, section_rows):
@@ -640,6 +667,20 @@ def render_single_stock(info, financials, balance_sheet, cashflow, hist, earning
                               legend=dict(orientation="h"),
                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
             st.plotly_chart(fig, use_container_width=True)
+
+    # 0 · Price Performance
+    perf = calc_period_returns(hist)
+    st.subheader("0 · Price Performance")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    def _pct(v):
+        return f"{v:+.2f}%" if v is not None else "N/A"
+    c1.metric("1 Day",    _pct(perf["1d"]))
+    c2.metric("5 Days",   _pct(perf["5d"]))
+    c3.metric("1 Month",  _pct(perf["1m"]))
+    c4.metric("3 Months", _pct(perf["3m"]))
+    c5.metric("6 Months", _pct(perf["6m"]))
+    c6.metric("1 Year",   _pct(perf["1y"]))
+    st.divider()
 
     # 1 · Profitability
     st.subheader("1 · Profitability")
@@ -1131,9 +1172,14 @@ def _get_rsi_macd(hist):
 
 def _build_screener_df(data):
     display = data.copy()
-    display["4W Ret%"] = display["_4w"].apply(
-        lambda r: f"{r:+.2f}%" if r is not None else "N/A"
-    )
+    for col, key in [("1d%", "_1d"), ("5d%", "_5d"), ("1m%", "_1m"),
+                     ("3m%", "_3m"), ("6m%", "_6m"), ("1y%", "_1y")]:
+        if key in display.columns:
+            display[col] = display[key].apply(
+                lambda r: f"{r:+.2f}%" if r is not None else "N/A"
+            )
+        else:
+            display[col] = "N/A"
     display["RSI"] = display["_rsi"].apply(
         lambda r: f"{r:.0f} ({'OB' if r > 70 else ('OS' if r < 30 else 'OK')})"
         if r is not None else "N/A"
@@ -1141,58 +1187,149 @@ def _build_screener_df(data):
     display["Rec"] = display["Score"].apply(
         lambda s: f"{score_badge(s)} {score_label(s)}"
     )
-    display["YF"] = display["Symbol"].apply(
+    display["Ticker"] = display["Symbol"].apply(
         lambda s: f"https://finance.yahoo.com/quote/{s}"
     )
-    cols = ["Symbol", "YF", "Price", "Sector", "4W Ret%",
+    cols = ["Ticker", "Price", "Sector", "1d%", "5d%", "1m%", "3m%", "6m%", "1y%",
             "Growth", "Profit", "Mgmt/Debt", "Momentum", "Score",
             "Rec", "RSI", "MACD", "MA Signal"]
     return display[cols].reset_index(drop=True)
 
 
-def _show_screener_table(data, key, height):
+def _show_screener_table(data, key, height, show_notes=True):
+    symbols = data["Symbol"].tolist()
     df = _build_screener_df(data)
-    notes_store = st.session_state.get("screener_notes", {})
-    df["Notes"] = df["Symbol"].map(lambda s: notes_store.get(s, ""))
+
+    col_cfg = {
+        "Ticker": st.column_config.LinkColumn(
+            "Ticker",
+            display_text=r"quote/([^/?]+)",
+            help="Ticker symbol — click to open on Yahoo Finance in a new tab",
+            width="small",
+        ),
+        "Price": st.column_config.TextColumn(
+            "Price ($)", width="small", disabled=True,
+            help="Current share price in USD",
+        ),
+        "Sector": st.column_config.TextColumn(
+            "Sector", disabled=True,
+            help="GICS sector classification",
+        ),
+        "1d%": st.column_config.TextColumn("1d %", width="small", disabled=True,
+            help="Price change over 1 trading day"),
+        "5d%": st.column_config.TextColumn("5d %", width="small", disabled=True,
+            help="Price change over 5 trading days (~1 week)"),
+        "1m%": st.column_config.TextColumn("1m %", width="small", disabled=True,
+            help="Price change over ~21 trading days (1 month)"),
+        "3m%": st.column_config.TextColumn("3m %", width="small", disabled=True,
+            help="Price change over ~63 trading days (3 months)"),
+        "6m%": st.column_config.TextColumn("6m %", width="small", disabled=True,
+            help="Price change over ~126 trading days (6 months)"),
+        "1y%": st.column_config.TextColumn("1y %", width="small", disabled=True,
+            help="Price change over ~251 trading days (1 year)"),
+        "Growth": st.column_config.NumberColumn(
+            "Growth", disabled=True, format="%.0f",
+            help="Growth score 0–100: revenue growth (25%), EPS growth (25%), "
+                 "forward vs trailing P/E ratio (25%), analyst price-target upside (25%)",
+        ),
+        "Profit": st.column_config.NumberColumn(
+            "Profit", disabled=True, format="%.0f",
+            help="Profitability score 0–100: net profit margin (25%), "
+                 "return on equity ROE (25%), operating margin (25%), return on assets ROA (25%)",
+        ),
+        "Mgmt/Debt": st.column_config.NumberColumn(
+            "Mgmt/Debt", disabled=True, format="%.0f",
+            help="Management & balance-sheet score 0–100: debt-to-equity ratio (25%), "
+                 "current ratio (25%), free-cash-flow yield (25%), quick ratio (25%)",
+        ),
+        "Momentum": st.column_config.NumberColumn(
+            "Momentum", disabled=True, format="%.0f",
+            help="Momentum score 0–100: 4-week price return (25%), "
+                 "price vs 50-day MA (25%), price vs 200-day MA (25%), RSI(14) sweet-spot (25%)",
+        ),
+        "Score": st.column_config.NumberColumn(
+            "Score", disabled=True, format="%.0f",
+            help="Composite score — equal-weight average of Growth, Profit, Mgmt/Debt, Momentum. "
+                 "≥80 Strong Buy · ≥65 Buy · ≥50 Hold · ≥35 Caution · <35 Avoid",
+        ),
+        "Rec": st.column_config.TextColumn(
+            "Signal", disabled=True,
+            help="Recommendation signal derived from Score: "
+                 "🟢 Strong Buy (≥80) · 🟩 Buy (≥65) · 🟡 Hold (≥50) · 🟠 Caution (≥35) · 🔴 Avoid (<35)",
+        ),
+        "RSI": st.column_config.TextColumn(
+            "RSI", width="small", disabled=True,
+            help="14-day Relative Strength Index. "
+                 "OB = Overbought (>70, may pull back) · OS = Oversold (<30, may bounce) · OK = Neutral (30–70)",
+        ),
+        "MACD": st.column_config.TextColumn(
+            "MACD", width="small", disabled=True,
+            help="MACD momentum indicator: Bullish = MACD line above signal line (upward momentum), "
+                 "Bearish = MACD below signal line (downward momentum)",
+        ),
+        "MA Signal": st.column_config.TextColumn(
+            "MA Signal", disabled=True,
+            help="Price position vs moving averages. "
+                 "↑ 50d = above 50-day MA · ↓ 50d = below · ↑ 200d = above 200-day MA · ↓ 200d = below",
+        ),
+    }
+
+    if show_notes:
+        notes_store = st.session_state.get("screener_notes", {})
+        df["Notes"] = [notes_store.get(s, "") for s in symbols]
+        col_cfg["Notes"] = st.column_config.TextColumn(
+            "📝 Notes / Actions", width="large",
+            help="Personal notes saved to disk — type and click away to save",
+        )
 
     edited = st.data_editor(
         df,
         use_container_width=True,
         height=height,
         key=key,
-        column_config={
-            "Symbol":    st.column_config.TextColumn("Ticker", width="small", disabled=True),
-            "YF":        st.column_config.LinkColumn("Yahoo Finance", display_text="📊 Open", width="small"),
-            "Price":     st.column_config.TextColumn("Price", width="small", disabled=True),
-            "Sector":    st.column_config.TextColumn("Sector", disabled=True),
-            "4W Ret%":   st.column_config.TextColumn("4W Ret%", width="small", disabled=True),
-            "Growth":    st.column_config.ProgressColumn("Growth",    min_value=0, max_value=100, format="%.0f"),
-            "Profit":    st.column_config.ProgressColumn("Profit",    min_value=0, max_value=100, format="%.0f"),
-            "Mgmt/Debt": st.column_config.ProgressColumn("Mgmt/Debt", min_value=0, max_value=100, format="%.0f"),
-            "Momentum":  st.column_config.ProgressColumn("Momentum",  min_value=0, max_value=100, format="%.0f"),
-            "Score":     st.column_config.ProgressColumn("Score",     min_value=0, max_value=100, format="%.0f"),
-            "Rec":       st.column_config.TextColumn("Signal",    disabled=True),
-            "RSI":       st.column_config.TextColumn("RSI",       width="small", disabled=True),
-            "MACD":      st.column_config.TextColumn("MACD",      width="small", disabled=True),
-            "MA Signal": st.column_config.TextColumn("MA Signal", disabled=True),
-            "Notes":     st.column_config.TextColumn("📝 Notes / Actions", width="large"),
-        },
+        column_config=col_cfg,
         hide_index=True,
     )
 
-    updated = dict(zip(edited["Symbol"], edited["Notes"]))
-    st.session_state["screener_notes"] = {**notes_store, **updated}
+    if show_notes:
+        existing = st.session_state.get("screener_notes", {})
+        updated = dict(zip(symbols, edited["Notes"]))
+        merged = {**existing, **updated}
+        merged = {k: v for k, v in merged.items() if v}  # drop blanks
+        st.session_state["screener_notes"] = merged
+        _save_notes(merged)
 
 
 import pickle as _pickle
+import json as _json
 
 _SCREENER_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_cache.pkl")
+_NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screener_notes.json")
 
 
-def _load_screener_cache():
+def _load_notes():
     try:
-        if os.path.exists(_SCREENER_CACHE_FILE):
-            with open(_SCREENER_CACHE_FILE, "rb") as f:
+        if os.path.exists(_NOTES_FILE):
+            with open(_NOTES_FILE, "r") as f:
+                return _json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_notes(notes):
+    try:
+        with open(_NOTES_FILE, "w") as f:
+            _json.dump({k: v for k, v in notes.items() if v}, f)
+    except Exception:
+        pass
+
+
+def _load_screener_cache(cache_file=None):
+    cf = cache_file or _SCREENER_CACHE_FILE
+    try:
+        if os.path.exists(cf):
+            with open(cf, "rb") as f:
                 data = _pickle.load(f)
             return data.get("rows"), data.get("timestamp")
     except Exception:
@@ -1200,53 +1337,63 @@ def _load_screener_cache():
     return None, None
 
 
-def _save_screener_cache(rows, timestamp):
+def _save_screener_cache(rows, timestamp, cache_file=None):
+    cf = cache_file or _SCREENER_CACHE_FILE
     try:
-        with open(_SCREENER_CACHE_FILE, "wb") as f:
+        with open(cf, "wb") as f:
             _pickle.dump({"rows": rows, "timestamp": timestamp}, f)
     except Exception:
         pass
 
 
-def _clear_screener_cache():
+def _clear_screener_cache(cache_file=None):
+    cf = cache_file or _SCREENER_CACHE_FILE
     try:
-        if os.path.exists(_SCREENER_CACHE_FILE):
-            os.remove(_SCREENER_CACHE_FILE)
+        if os.path.exists(cf):
+            os.remove(cf)
     except Exception:
         pass
 
 
-def render_screener():
+def render_screener(universe=None, label="all"):
+    if universe is None:
+        universe = STOCK_UNIVERSE
+    cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"screener_cache_{label}.pkl")
+    rows_key = f"screener_rows_{label}"
+    ts_key   = f"screener_cache_ts_{label}"
+
     st.markdown(
-        "Scans **~120 popular stocks** to find the **top 20 gainers** and "
+        f"Scans **{len(universe)} stocks** to find the **top 20 gainers** and "
         "**bottom 20 losers** over the last 4 weeks, then scores each on four "
         "equal-weight pillars."
     )
 
-    # Load disk cache into session state on first visit this session
-    if "screener_rows" not in st.session_state:
-        cached_rows, cached_ts = _load_screener_cache()
+    if rows_key not in st.session_state:
+        cached_rows, cached_ts = _load_screener_cache(cache_file)
         if cached_rows is not None:
-            st.session_state["screener_rows"]     = cached_rows
-            st.session_state["screener_cache_ts"] = cached_ts
+            st.session_state[rows_key] = cached_rows
+            st.session_state[ts_key]   = cached_ts
+
+    if "screener_notes" not in st.session_state:
+        st.session_state["screener_notes"] = _load_notes()
 
     col_btn, col_clear, col_hint = st.columns([1, 1, 3])
     run_btn   = col_btn.button("▶ Run Screener",  type="primary",
-                               use_container_width=True, key="screener_run")
+                               use_container_width=True, key=f"screener_run_{label}")
     clear_btn = col_clear.button("🗑 Clear Cache", use_container_width=True,
-                                 key="screener_clear")
+                                 key=f"screener_clear_{label}")
     col_hint.caption(
         "⏱ First run ~90 s · Results cached to disk indefinitely · "
         "Scoring: 25% Future Growth  ·  25% Profitability  ·  25% Mgmt/Debt  ·  25% Momentum"
     )
 
     if clear_btn:
-        _clear_screener_cache()
-        st.session_state.pop("screener_rows", None)
-        st.session_state.pop("screener_cache_ts", None)
+        _clear_screener_cache(cache_file)
+        st.session_state.pop(rows_key, None)
+        st.session_state.pop(ts_key, None)
         st.rerun()
 
-    if not run_btn and "screener_rows" not in st.session_state:
+    if not run_btn and rows_key not in st.session_state:
         c = st.columns(4)
         c[0].info("**📈 Growth (25%)**\nRevenue growth · EPS growth · Fwd vs trailing P/E · Analyst upside")
         c[1].info("**💰 Profitability (25%)**\nNet margin · ROE · Operating margin · ROA")
@@ -1255,11 +1402,11 @@ def render_screener():
         return
 
     if run_btn:
-        st.session_state.pop("screener_rows", None)
-        st.session_state.pop("screener_cache_ts", None)
+        st.session_state.pop(rows_key, None)
+        st.session_state.pop(ts_key, None)
 
-    if "screener_rows" not in st.session_state:
-        tickers_tuple = tuple(sorted(STOCK_UNIVERSE))
+    if rows_key not in st.session_state:
+        tickers_tuple = tuple(sorted(universe))
 
         prog = st.progress(0, text="Fetching 4-week returns for universe…")
         returns = fetch_universe_4week_returns(tickers_tuple)
@@ -1295,6 +1442,7 @@ def render_screener():
                 comp = composite_score_val(g, b, md, mom)
 
                 rsi_val, macd_sig = _get_rsi_macd(hist)
+                period_rets = calc_period_returns(hist)
 
                 price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
                 ma50  = safe_float(info.get("fiftyDayAverage"))
@@ -1312,6 +1460,12 @@ def render_screener():
                     "Price":     f"${price:.2f}" if price else "N/A",
                     "Sector":    info.get("sector", "N/A"),
                     "_4w":       four_wk,
+                    "_1d":       period_rets["1d"],
+                    "_5d":       period_rets["5d"],
+                    "_1m":       period_rets["1m"],
+                    "_3m":       period_rets["3m"],
+                    "_6m":       period_rets["6m"],
+                    "_1y":       period_rets["1y"],
                     "Growth":    round(g,   1),
                     "Profit":    round(b,   1),
                     "Mgmt/Debt": round(md,  1),
@@ -1333,12 +1487,12 @@ def render_screener():
             return
 
         now = datetime.now()
-        st.session_state["screener_rows"]     = rows
-        st.session_state["screener_cache_ts"] = now
-        _save_screener_cache(rows, now)
+        st.session_state[rows_key] = rows
+        st.session_state[ts_key]   = now
+        _save_screener_cache(rows, now, cache_file)
 
     # ── Cache age warning ─────────────────────────────────────────────────────
-    ts = st.session_state.get("screener_cache_ts")
+    ts = st.session_state.get(ts_key)
     if ts:
         age   = datetime.now() - ts
         total = int(age.total_seconds())
@@ -1355,7 +1509,7 @@ def render_screener():
             "Click **▶ Run Screener** to refresh or **🗑 Clear Cache** to reset."
         )
 
-    rows = st.session_state["screener_rows"]
+    rows = st.session_state[rows_key]
     df   = pd.DataFrame(rows)
 
     top_df = df[df["_group"] == "Top 20"].sort_values("Score", ascending=False)
@@ -1366,7 +1520,7 @@ def render_screener():
     st.markdown("## 🚀 Top 20 Gainers — Last 4 Weeks")
     st.caption("Sorted by composite recommendation score (highest = strongest fundamentals)")
     if not top_df.empty:
-        _show_screener_table(top_df, key="screener_top", height=560)
+        _show_screener_table(top_df, key=f"screener_top_{label}", height=560, show_notes=False)
     else:
         st.info("No top-gainer data.")
 
@@ -1375,15 +1529,16 @@ def render_screener():
     st.markdown("## 📉 Bottom 20 Losers — Last 4 Weeks")
     st.caption("High score here may signal an oversold buying opportunity; low score confirms weakness")
     if not bot_df.empty:
-        _show_screener_table(bot_df, key="screener_bot", height=560)
+        _show_screener_table(bot_df, key=f"screener_bot_{label}", height=560, show_notes=False)
     else:
         st.info("No bottom-loser data.")
 
     # ── Combined all 40, sorted by score ──
     st.markdown("---")
     st.markdown("## 📊 All Candidates — Ranked by Score")
+    st.caption("📝 Notes are editable here and saved to disk automatically")
     all_sorted = df.sort_values("Score", ascending=False)
-    _show_screener_table(all_sorted, key="screener_all", height=900)
+    _show_screener_table(all_sorted, key=f"screener_all_{label}", height=900, show_notes=True)
 
     # ── Score legend ──
     st.markdown("---")
@@ -1454,4 +1609,10 @@ with tab_compare:
 
 # ── Screener tab ──────────────────────────────────────────────────────────────
 with tab_screener:
-    render_screener()
+    st_ai, st_nonai, st_all = st.tabs(["🤖 AI & Tech", "🏭 Non-AI", "🌐 All Stocks"])
+    with st_ai:
+        render_screener(AI_UNIVERSE, "ai")
+    with st_nonai:
+        render_screener(NON_AI_UNIVERSE, "nonai")
+    with st_all:
+        render_screener(STOCK_UNIVERSE, "all")
