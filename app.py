@@ -201,6 +201,67 @@ def calc_earnings_price_changes(earnings_dates_dict, hist):
         return empty
 
 
+def calc_technical_indicators(hist, info):
+    """RSI, MACD, Bollinger Bands, 52W range position, beta, volume, volatility."""
+    out = {k: None for k in ["rsi", "macd_sig", "macd_hist", "bb_pos",
+                              "w52_high", "w52_low", "w52_pos",
+                              "beta", "avg_vol", "rel_vol", "volatility"]}
+    out["beta"]    = safe_float(info.get("beta"))
+    out["w52_high"] = safe_float(info.get("fiftyTwoWeekHigh"))
+    out["w52_low"]  = safe_float(info.get("fiftyTwoWeekLow"))
+    out["avg_vol"]  = safe_float(info.get("averageVolume"))
+    price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    curr_vol = safe_float(info.get("regularMarketVolume") or info.get("volume"))
+    if out["avg_vol"] and curr_vol and out["avg_vol"] > 0:
+        out["rel_vol"] = curr_vol / out["avg_vol"]
+    h = out["w52_high"]; l = out["w52_low"]
+    if h and l and price and (h - l) > 0:
+        out["w52_pos"] = (price - l) / (h - l) * 100
+
+    if hist is None or hist.empty or len(hist) < 30:
+        return out
+    closes = hist["Close"]
+
+    try:
+        rsi_s = _calc_rsi(closes)
+        v = rsi_s.dropna()
+        if not v.empty:
+            out["rsi"] = float(v.iloc[-1])
+    except Exception:
+        pass
+
+    try:
+        ema12 = closes.ewm(span=12).mean()
+        ema26 = closes.ewm(span=26).mean()
+        macd  = ema12 - ema26
+        sig   = macd.ewm(span=9).mean()
+        h_val = float((macd - sig).iloc[-1])
+        out["macd_sig"]  = "Bullish" if h_val > 0 else "Bearish"
+        out["macd_hist"] = h_val
+    except Exception:
+        pass
+
+    try:
+        sma20 = closes.rolling(20).mean()
+        std20 = closes.rolling(20).std()
+        upper = (sma20 + 2 * std20).iloc[-1]
+        lower = (sma20 - 2 * std20).iloc[-1]
+        curr  = float(closes.iloc[-1])
+        if upper != lower:
+            out["bb_pos"] = (curr - lower) / (upper - lower) * 100
+    except Exception:
+        pass
+
+    try:
+        ret = closes.pct_change().dropna()
+        if len(ret) >= 20:
+            out["volatility"] = float(ret.tail(20).std() * (252 ** 0.5) * 100)
+    except Exception:
+        pass
+
+    return out
+
+
 def assess_moat(info):
     score = 0
     signals = []
@@ -800,40 +861,67 @@ def render_single_stock(info, financials, balance_sheet, cashflow, hist, earning
 # ─── Compare view ─────────────────────────────────────────────────────────────
 
 def render_compare(api_key):
-    st.markdown("Enter up to 3 ticker symbols to compare all metrics side by side.")
+    # ── Stock selection ───────────────────────────────────────────────────────
+    if "compare_tickers" not in st.session_state:
+        st.session_state["compare_tickers"] = ["AAPL", "MSFT", "GOOGL"]
 
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
-    t1 = col1.text_input("Stock 1", value="AAPL", key="cmp1").strip().upper()
-    t2 = col2.text_input("Stock 2", value="MSFT", key="cmp2").strip().upper()
-    t3 = col3.text_input("Stock 3", value="GOOGL", key="cmp3").strip().upper()
-    compare_btn = col4.button("Compare", type="primary", use_container_width=True,
-                              key="compare_btn")
+    st.markdown("Add up to **10 tickers**. Check ✓ to include in the comparison.")
+
+    to_remove = None
+    selected = []
+    h1, h2, h3 = st.columns([4, 1, 1])
+    h1.caption("Ticker"); h2.caption("Include"); h3.caption("")
+
+    for i in range(len(st.session_state["compare_tickers"])):
+        c1, c2, c3 = st.columns([4, 1, 1])
+        sym = c1.text_input(
+            f"t{i}", value=st.session_state["compare_tickers"][i],
+            placeholder=f"e.g. NVDA", label_visibility="collapsed", key=f"cmp_t_{i}",
+        ).strip().upper()
+        included = c2.checkbox("✓", value=True, key=f"cmp_s_{i}", label_visibility="collapsed")
+        if c3.button("✕", key=f"cmp_r_{i}", help="Remove"):
+            to_remove = i
+        st.session_state["compare_tickers"][i] = sym
+        if included and sym:
+            selected.append(sym)
+
+    if to_remove is not None:
+        st.session_state["compare_tickers"].pop(to_remove)
+        st.rerun()
+
+    ca, cb, _ = st.columns([1, 1, 4])
+    if ca.button("＋ Add Ticker", use_container_width=True, key="cmp_add"):
+        if len(st.session_state["compare_tickers"]) < 10:
+            st.session_state["compare_tickers"].append("")
+            st.rerun()
+    compare_btn = cb.button("Compare ▶", type="primary", use_container_width=True, key="compare_btn")
 
     if not compare_btn:
-        st.info("Fill in the tickers above and click **Compare**.")
+        st.info("Fill in tickers above and click **Compare ▶**.")
         return
 
-    tickers = [t for t in [t1, t2, t3] if t]
+    tickers = list(dict.fromkeys(t for t in selected if t))  # dedupe, preserve order
     if len(tickers) < 2:
-        st.warning("Enter at least 2 ticker symbols.")
+        st.warning("Select at least 2 tickers.")
         return
 
-    # Fetch all stocks
+    # ── Fetch data ────────────────────────────────────────────────────────────
     all_metrics = []
     all_hists   = {}
-    errors = []
+    all_tech    = {}
+    errors      = []
 
     progress = st.progress(0, text="Fetching data…")
     for i, sym in enumerate(tickers):
-        progress.progress((i) / len(tickers), text=f"Fetching {sym}…")
+        progress.progress(i / len(tickers), text=f"Fetching {sym}…")
         try:
             info, fin, bs, cf, hist, ed = fetch_data(sym)
             if info is None:
                 errors.append(f"{sym}: could not fetch data (check ticker)")
                 continue
-            m = extract_all_metrics(sym, info, fin, bs, cf, hist, ed)
-            all_metrics.append(m)
+            all_metrics.append(extract_all_metrics(sym, info, fin, bs, cf, hist, ed))
             all_hists[sym] = hist
+            all_tech[sym]  = calc_technical_indicators(hist, info)
         except RuntimeError as e:
             errors.append(f"{sym}: {e}")
         except Exception as e:
@@ -851,6 +939,8 @@ def render_compare(api_key):
 
     symbols = [m["symbol"] for m in all_metrics]
     names   = {m["symbol"]: m["name"] for m in all_metrics}
+    colors  = ["#1f77b4","#ff7f0e","#2ca02c","#d62728","#9467bd",
+               "#8c564b","#e377c2","#7f7f7f","#bcbd22","#17becf"]
 
     # ── Header cards ──────────────────────────────────────────────────────────
     st.divider()
@@ -863,61 +953,95 @@ def render_compare(api_key):
 
     # ── Normalized price chart ────────────────────────────────────────────────
     st.divider()
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
     with st.expander("📊 Normalized 1-Year Price Performance (base = 100)", expanded=True):
         fig = go.Figure()
         for i, sym in enumerate(symbols):
-            hist = all_hists.get(sym)
-            if hist is not None and not hist.empty:
-                base = hist["Close"].iloc[0]
-                normalized = hist["Close"] / base * 100
-                fig.add_trace(go.Scatter(
-                    x=hist.index, y=normalized,
+            h = all_hists.get(sym)
+            if h is not None and not h.empty:
+                norm = h["Close"] / h["Close"].iloc[0] * 100
+                fig.add_trace(go.Scatter(x=h.index, y=norm,
                     name=f"{sym} — {names[sym]}",
-                    line=dict(color=colors[i % len(colors)], width=2),
-                ))
+                    line=dict(color=colors[i % len(colors)], width=2)))
         fig.add_hline(y=100, line_dash="dot", line_color="gray", line_width=1)
-        fig.update_layout(
-            height=380, margin=dict(l=0, r=0, t=20, b=0),
-            xaxis_title=None, yaxis_title="Indexed (start = 100)",
+        fig.update_layout(height=380, margin=dict(l=0, r=0, t=20, b=0),
+            xaxis_title=None, yaxis_title="Indexed (start=100)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        )
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
 
-    # ── Metric comparison tables ──────────────────────────────────────────────
-    st.divider()
-    st.markdown("### Metric Comparison")
-    st.caption("🟢 Best value in row  ·  🔴 Worst value  ·  Gray = middle or N/A")
+    # ── Volume chart ──────────────────────────────────────────────────────────
+    with st.expander("📊 Volume (1 Year)", expanded=False):
+        fig2 = go.Figure()
+        for i, sym in enumerate(symbols):
+            h = all_hists.get(sym)
+            if h is not None and not h.empty and "Volume" in h.columns:
+                fig2.add_trace(go.Scatter(x=h.index, y=h["Volume"], name=sym,
+                    line=dict(color=colors[i % len(colors)])))
+        fig2.update_layout(height=280, margin=dict(l=0, r=0, t=20, b=0),
+            xaxis_title=None, yaxis_title="Volume",
+            legend=dict(orientation="h"),
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    for section_name, rows in COMPARE_SECTIONS.items():
+    # ── Fundamental comparison ────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Fundamental Comparison")
+    st.caption("🟢 Best value in row  ·  🔴 Worst value  ·  Gray = middle or N/A")
+    for section_name, sec_rows in COMPARE_SECTIONS.items():
         st.markdown(f"**{section_name}**")
-        styled_df = build_comparison_df(all_metrics, rows)
-        st.dataframe(styled_df, use_container_width=True)
+        st.dataframe(build_comparison_df(all_metrics, sec_rows), use_container_width=True)
         st.markdown("")
 
-    # ── Qualitative row: Moat + Rec ───────────────────────────────────────────
-    st.markdown("**Qualitative Summary**")
     moat_icon = {"green": "🟢", "orange": "🟡", "red": "🔴"}
-    qual_rows = []
-    for m in all_metrics:
-        qual_rows.append({
-            "Stock": m["symbol"],
-            "Moat": f"{moat_icon.get(m['moat_color'],'')} {m['moat_rating']}",
-            "Market Position": m["cap_desc"],
-            "Analyst Rec.": m["rec_label"],
-            "Earnings Date": m["earnings_date"],
-        })
+    st.markdown("**Qualitative Summary**")
+    qual_rows = [{"Stock": m["symbol"],
+                  "Moat": f"{moat_icon.get(m['moat_color'],'')} {m['moat_rating']}",
+                  "Market Position": m["cap_desc"],
+                  "Analyst Rec.": m["rec_label"],
+                  "Earnings Date": m["earnings_date"]} for m in all_metrics]
     st.dataframe(pd.DataFrame(qual_rows).set_index("Stock"), use_container_width=True)
+
+    # ── Technical Analysis ────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Technical Analysis")
+
+    def _rsi_label(v):
+        if v is None: return "N/A"
+        tag = " ⚠OB" if v > 70 else (" ⚠OS" if v < 30 else "")
+        return f"{v:.0f}{tag}"
+
+    def _bb_label(v):
+        if v is None: return "N/A"
+        note = " (near upper)" if v >= 85 else (" (near lower)" if v <= 15 else "")
+        return f"{v:.0f}%{note}"
+
+    tech_spec = [
+        ("RSI (14)",           "rsi",       _rsi_label),
+        ("MACD Signal",        "macd_sig",  lambda v: v or "N/A"),
+        ("Bollinger Position", "bb_pos",    _bb_label),
+        ("52W High",           "w52_high",  lambda v: f"${v:.2f}" if v else "N/A"),
+        ("52W Low",            "w52_low",   lambda v: f"${v:.2f}" if v else "N/A"),
+        ("52W Range %",        "w52_pos",   lambda v: f"{v:.0f}% of range" if v is not None else "N/A"),
+        ("Beta",               "beta",      lambda v: f"{v:.2f}" if v else "N/A"),
+        ("Avg Volume (50d)",   "avg_vol",   lambda v: f"{v/1e6:.1f}M" if v else "N/A"),
+        ("Relative Volume",    "rel_vol",   lambda v: f"{v:.2f}x" if v else "N/A"),
+        ("Ann. Volatility",    "volatility",lambda v: f"{v:.1f}%" if v else "N/A"),
+    ]
+
+    tech_rows = []
+    for label, key, fmt in tech_spec:
+        row = {"Metric": label}
+        for sym in symbols:
+            row[sym] = fmt(all_tech.get(sym, {}).get(key))
+        tech_rows.append(row)
+    st.dataframe(pd.DataFrame(tech_rows).set_index("Metric"), use_container_width=True)
 
     # ── AI Analysis ───────────────────────────────────────────────────────────
     st.divider()
     st.markdown("### AI Analysis")
-
     if not api_key:
         st.info("Enter your **Anthropic API key** in the sidebar to unlock AI analysis.")
         return
-
     if st.button("Generate AI Summary", type="primary", key="ai_btn"):
         prompt = build_llm_prompt(all_metrics)
         st.markdown("---")
@@ -1088,8 +1212,11 @@ def score_momentum(four_wk_return, info, hist):
     return min(100, s)
 
 
-def composite_score_val(g, b, m, mom):
-    return round(0.25 * g + 0.25 * b + 0.25 * m + 0.25 * mom, 1)
+def composite_score_val(g, b, m, mom, w_g=1, w_b=1, w_m=1, w_mom=1):
+    total = w_g + w_b + w_m + w_mom
+    if total == 0:
+        return 0.0
+    return round((w_g * g + w_b * b + w_m * m + w_mom * mom) / total, 1)
 
 
 def score_label(score):
@@ -1377,6 +1504,27 @@ def render_screener(universe=None, label="all"):
     if "screener_notes" not in st.session_state:
         st.session_state["screener_notes"] = _load_notes()
 
+    # ── Scoring weights ───────────────────────────────────────────────────────
+    with st.expander("⚙️ Scoring Weights & Categories", expanded=False):
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        w_g   = wc1.slider("📈 Growth",       0, 100, 25, step=5, key=f"w_g_{label}")
+        w_b   = wc2.slider("💰 Profitability", 0, 100, 25, step=5, key=f"w_b_{label}")
+        w_m   = wc3.slider("🛡 Mgmt/Debt",    0, 100, 25, step=5, key=f"w_m_{label}")
+        w_mom = wc4.slider("⚡ Momentum",     0, 100, 25, step=5, key=f"w_mom_{label}")
+        total_w = w_g + w_b + w_m + w_mom
+        if total_w > 0:
+            st.caption(
+                f"Effective weights — "
+                f"Growth: {w_g/total_w*100:.0f}%  ·  "
+                f"Profitability: {w_b/total_w*100:.0f}%  ·  "
+                f"Mgmt/Debt: {w_m/total_w*100:.0f}%  ·  "
+                f"Momentum: {w_mom/total_w*100:.0f}%"
+            )
+        else:
+            st.warning("At least one weight must be > 0. Defaulting to equal weights.")
+            w_g = w_b = w_m = w_mom = 25
+    st.divider()
+
     col_btn, col_clear, col_hint = st.columns([1, 1, 3])
     run_btn   = col_btn.button("▶ Run Screener",  type="primary",
                                use_container_width=True, key=f"screener_run_{label}")
@@ -1512,6 +1660,13 @@ def render_screener(universe=None, label="all"):
     rows = st.session_state[rows_key]
     df   = pd.DataFrame(rows)
 
+    # Re-score with current weights (no re-fetch needed)
+    df["Score"] = df.apply(
+        lambda r: composite_score_val(r["Growth"], r["Profit"], r["Mgmt/Debt"], r["Momentum"],
+                                      w_g, w_b, w_m, w_mom),
+        axis=1,
+    )
+
     top_df = df[df["_group"] == "Top 20"].sort_values("Score", ascending=False)
     bot_df = df[df["_group"] == "Bottom 20"].sort_values("Score", ascending=False)
 
@@ -1579,7 +1734,7 @@ with st.sidebar:
     st.divider()
     st.caption("Data cached 10 min · Moat is a proxy metric · Not financial advice")
 
-tab_single, tab_compare, tab_screener = st.tabs(["Single Stock", "Compare 3 Stocks", "Stock Screener"])
+tab_single, tab_compare, tab_screener = st.tabs(["Single Stock", "Compare Stocks", "Stock Screener"])
 
 # ── Single Stock tab ──────────────────────────────────────────────────────────
 with tab_single:
