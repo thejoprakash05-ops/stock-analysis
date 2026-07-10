@@ -9,6 +9,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
 import os
@@ -364,6 +365,115 @@ def fetch_data(symbol):
     return info, financials, balance_sheet, cashflow, hist, earnings_dates_dict
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_macro_snapshot():
+    """1-day % change for macro indicators, batch downloaded."""
+    syms = list(MACRO_TICKERS.values())
+    try:
+        raw = yf.download(syms, period="5d", auto_adjust=True, progress=False, threads=True)
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": syms[0]})
+        out = {}
+        for name, sym in MACRO_TICKERS.items():
+            try:
+                prices = close[sym].dropna()
+                if len(prices) >= 2:
+                    last, prev = float(prices.iloc[-1]), float(prices.iloc[-2])
+                    out[name] = {"price": last, "change": (last - prev) / prev * 100, "symbol": sym}
+                else:
+                    out[name] = {"price": None, "change": None, "symbol": sym}
+            except Exception:
+                out[name] = {"price": None, "change": None, "symbol": sym}
+        return out
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_sector_returns():
+    """1-day % return for each sector ETF."""
+    syms = list(SECTOR_ETFS.values())
+    try:
+        raw = yf.download(syms, period="5d", auto_adjust=True, progress=False, threads=True)
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]].rename(columns={"Close": syms[0]})
+        out = {}
+        for name, sym in SECTOR_ETFS.items():
+            try:
+                prices = close[sym].dropna()
+                out[name] = float((prices.iloc[-1] - prices.iloc[-2]) / prices.iloc[-2] * 100) if len(prices) >= 2 else None
+            except Exception:
+                out[name] = None
+        return out
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_chart_history(symbol, period):
+    """OHLCV history for a specific period (for the interactive chart)."""
+    try:
+        return yf.Ticker(symbol).history(period=period, auto_adjust=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_insider_data(symbol):
+    """Recent insider transactions."""
+    try:
+        df = yf.Ticker(symbol).insider_transactions
+        return df if df is not None and not df.empty else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_earnings_surprise(symbol):
+    """Past earnings: EPS estimate vs reported, with surprise %."""
+    try:
+        ed = yf.Ticker(symbol).earnings_dates
+        if ed is None or ed.empty:
+            return pd.DataFrame()
+        cols = [c for c in ["EPS Estimate", "Reported EPS"] if c in ed.columns]
+        if len(cols) < 2:
+            return pd.DataFrame()
+        ed = ed.dropna(subset=cols).copy()
+        now = pd.Timestamp.now(tz="UTC")
+        ed = ed[ed.index < now].sort_index(ascending=False).head(8)
+        ed["Surprise"] = ed["Reported EPS"] - ed["EPS Estimate"]
+        ed["Surprise %"] = (ed["Surprise"] / ed["EPS Estimate"].abs() * 100).round(1)
+        ed.index = ed.index.strftime("%Y-%m-%d")
+        return ed[["EPS Estimate", "Reported EPS", "Surprise", "Surprise %"]]
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_peer_metrics(symbols_tuple):
+    """Key metrics for a tuple of peer symbols (cached per unique set)."""
+    results = []
+    for sym in symbols_tuple:
+        try:
+            info, *_ = fetch_data(sym)
+            if info is None:
+                continue
+            price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+            results.append({
+                "Symbol": sym,
+                "Name": (info.get("longName") or sym)[:22],
+                "Price": f"${price:.2f}" if price else "N/A",
+                "Mkt Cap": fmt_large(safe_float(info.get("marketCap"))),
+                "P/E": fmt_num(safe_float(info.get("trailingPE"))),
+                "Fwd P/E": fmt_num(safe_float(info.get("forwardPE"))),
+                "EPS": fmt_num(safe_float(info.get("trailingEps")), prefix="$"),
+                "ROE": fmt_pct(safe_float(info.get("returnOnEquity"))),
+                "Op. Margin": fmt_pct(safe_float(info.get("operatingMargins"))),
+                "Rev. Growth": fmt_pct(safe_float(info.get("revenueGrowth"))),
+            })
+        except Exception:
+            continue
+    return results
+
+
 # ─── Metrics extraction (for comparison) ─────────────────────────────────────
 
 def extract_all_metrics(symbol, info, financials, balance_sheet, cashflow, hist, earnings_dates_dict):
@@ -565,6 +675,22 @@ NON_AI_UNIVERSE = list(dict.fromkeys([
 
 STOCK_UNIVERSE = list(dict.fromkeys(AI_UNIVERSE + NON_AI_UNIVERSE))
 
+MACRO_TICKERS = {
+    "S&P 500": "^GSPC", "NASDAQ": "^IXIC", "Dow Jones": "^DJI",
+    "VIX": "^VIX", "10Y Yield": "^TNX", "Gold": "GC=F",
+    "Oil (WTI)": "CL=F", "US Dollar": "DX-Y.NYB", "USD/INR": "INR=X",
+}
+
+SECTOR_ETFS = {
+    "Technology": "XLK", "Healthcare": "XLV", "Financials": "XLF",
+    "Energy": "XLE", "Industrials": "XLI", "Cons. Disc.": "XLY",
+    "Cons. Staples": "XLP", "Utilities": "XLU", "Materials": "XLB",
+    "Real Estate": "XLRE", "Comm. Svcs": "XLC",
+}
+
+# sector name → list of STOCK_UNIVERSE tickers in that sector (populated lazily)
+_SECTOR_PEER_MAP: dict = {}
+
 
 def build_comparison_df(metrics_list, section_rows):
     """
@@ -712,21 +838,43 @@ def render_single_stock(info, financials, balance_sheet, cashflow, hist, earning
     st.caption(f"{exchange} · {sector} · {industry} · {currency} · Market Cap: {fmt_large(market_cap)}")
     st.divider()
 
-    if hist is not None and not hist.empty:
-        with st.expander("📊 1-Year Price Chart", expanded=True):
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=hist.index, y=hist["Close"], name="Price",
-                                     line=dict(color="#1f77b4", width=2)))
+    # ── Interactive price chart ───────────────────────────────────────────────
+    with st.expander("📊 Price Chart", expanded=True):
+        ct1, ct2, _ = st.columns([2, 2, 4])
+        chart_period = ct1.selectbox("Period", ["1mo","3mo","6mo","1y","2y","5y"],
+                                     index=3, key=f"cp_{symbol_input}")
+        chart_type   = ct2.selectbox("Type", ["Line","Candlestick"],
+                                     index=0, key=f"ct_{symbol_input}")
+        ch = fetch_chart_history(symbol_input, chart_period)
+        if ch is not None and not ch.empty:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                vertical_spacing=0.03, row_heights=[0.78, 0.22])
+            if chart_type == "Candlestick":
+                fig.add_trace(go.Candlestick(
+                    x=ch.index, open=ch["Open"], high=ch["High"],
+                    low=ch["Low"], close=ch["Close"], name="OHLC",
+                    increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+                ), row=1, col=1)
+            else:
+                fig.add_trace(go.Scatter(x=ch.index, y=ch["Close"], name="Close",
+                                         line=dict(color="#1f77b4", width=2)), row=1, col=1)
             if ma50:
                 fig.add_hline(y=ma50, line_dash="dot", line_color="orange",
-                              annotation_text=f"50-Day MA ${ma50:.2f}")
+                              annotation_text=f"50d ${ma50:.2f}", row=1, col=1)
             if ma200:
-                fig.add_hline(y=ma200, line_dash="dot", line_color="red",
-                              annotation_text=f"200-Day MA ${ma200:.2f}")
-            fig.update_layout(height=350, margin=dict(l=0, r=0, t=20, b=0),
-                              xaxis_title=None, yaxis_title="Price",
+                fig.add_hline(y=ma200, line_dash="dot", line_color="#ef5350",
+                              annotation_text=f"200d ${ma200:.2f}", row=1, col=1)
+            if "Volume" in ch.columns:
+                colors_vol = ["#26a69a" if ch["Close"].iloc[i] >= ch["Open"].iloc[i]
+                              else "#ef5350" for i in range(len(ch))]
+                fig.add_trace(go.Bar(x=ch.index, y=ch["Volume"], name="Volume",
+                                     marker_color=colors_vol, showlegend=False), row=2, col=1)
+            fig.update_layout(height=440, margin=dict(l=0, r=0, t=10, b=0),
+                              xaxis_rangeslider_visible=False,
                               legend=dict(orientation="h"),
                               plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+            fig.update_yaxes(title_text="Price", row=1, col=1)
+            fig.update_yaxes(title_text="Vol", row=2, col=1)
             st.plotly_chart(fig, use_container_width=True)
 
     # 0 · Price Performance
@@ -843,6 +991,122 @@ def render_single_stock(info, financials, balance_sheet, cashflow, hist, earning
         employees = info.get("fullTimeEmployees")
         if employees:
             st.caption(f"Employees: {employees:,}")
+    st.divider()
+
+    # 8 · Earnings Countdown + Next Earnings
+    next_earnings_date = None
+    try:
+        now_ts = pd.Timestamp.now(tz="UTC")
+        future_dates = [
+            pd.Timestamp(d) if not isinstance(d, pd.Timestamp) else d
+            for d in earnings_dates_dict.keys()
+            if pd.Timestamp(d).tzinfo is None and pd.Timestamp(d) > now_ts.replace(tzinfo=None)
+            or (hasattr(pd.Timestamp(d), "tzinfo") and pd.Timestamp(d).tzinfo is not None and pd.Timestamp(d) > now_ts)
+        ]
+        if future_dates:
+            next_earnings_date = min(future_dates)
+    except Exception:
+        pass
+
+    if next_earnings_date is not None:
+        try:
+            days_to_earnings = (next_earnings_date.replace(tzinfo=None) - pd.Timestamp.now().replace(tzinfo=None)).days
+        except Exception:
+            days_to_earnings = None
+        st.subheader("8 · Next Earnings")
+        ec1, ec2 = st.columns(2)
+        ec1.metric("Earnings Date", next_earnings_date.strftime("%Y-%m-%d"))
+        if days_to_earnings is not None:
+            urgency = "🔴" if days_to_earnings <= 7 else "🟡" if days_to_earnings <= 30 else "🟢"
+            ec2.metric("Days Away", f"{urgency} {days_to_earnings}d")
+        st.divider()
+
+    # 9 · Short Interest
+    short_pct   = info.get("shortPercentOfFloat")
+    short_ratio = info.get("shortRatio")
+    shares_short = info.get("sharesShort")
+    if any(v is not None for v in [short_pct, short_ratio, shares_short]):
+        st.subheader("9 · Short Interest")
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Short % of Float", f"{short_pct * 100:.1f}%" if short_pct else "N/A")
+        sc2.metric("Short Ratio (days)", f"{short_ratio:.1f}" if short_ratio else "N/A")
+        sc3.metric("Shares Short", fmt_large(safe_float(shares_short)) if shares_short else "N/A")
+        if short_pct and short_pct > 0.10:
+            st.caption(f"⚠️ High short interest ({short_pct*100:.1f}% of float) — elevated bearish sentiment or squeeze candidate.")
+        st.divider()
+
+    # 10 · Insider Transactions
+    with st.expander("👥 Insider Transactions", expanded=False):
+        insider_df = fetch_insider_data(symbol_input)
+        if insider_df.empty:
+            st.caption("No insider transaction data available.")
+        else:
+            show_cols = [c for c in ["Date", "Insider", "Position", "Transaction", "Shares", "Value"] if c in insider_df.columns]
+            if not show_cols:
+                show_cols = list(insider_df.columns[:6])
+            st.dataframe(insider_df[show_cols].head(15), use_container_width=True)
+
+    # 11 · Earnings Surprise History
+    with st.expander("📈 Earnings Surprise History", expanded=False):
+        surp_df = fetch_earnings_surprise(symbol_input)
+        if surp_df.empty:
+            st.caption("No earnings surprise data available.")
+        else:
+            def _color_surprise(val):
+                try:
+                    v = float(val)
+                    return "color: #22c55e" if v > 0 else "color: #ef4444"
+                except Exception:
+                    return ""
+            st.dataframe(
+                surp_df.style.applymap(_color_surprise, subset=["Surprise %"]),
+                use_container_width=True,
+            )
+
+    # 12 · Peer Comparison
+    with st.expander("🏁 Peer Comparison", expanded=False):
+        current_sector = info.get("sector", "")
+        if current_sector and not _SECTOR_PEER_MAP.get(current_sector):
+            _SECTOR_PEER_MAP[current_sector] = [
+                s for s in STOCK_UNIVERSE if s != symbol_input
+            ]
+        sector_pool = _SECTOR_PEER_MAP.get(current_sector, [])
+        # pick up to 8 peers: first the ones in the same industry, then fill with sector
+        current_industry = info.get("industry", "")
+        industry_peers: list[str] = []
+        other_peers: list[str] = []
+        for s in sector_pool:
+            try:
+                s_info_peek, *_ = fetch_data(s)
+                if s_info_peek is None:
+                    continue
+                if s_info_peek.get("industry") == current_industry:
+                    industry_peers.append(s)
+                else:
+                    other_peers.append(s)
+            except Exception:
+                continue
+            if len(industry_peers) >= 5:
+                break
+        peer_symbols = (industry_peers + other_peers)[:8]
+        all_peer_symbols = tuple([symbol_input] + peer_symbols)
+        if peer_symbols:
+            with st.spinner("Fetching peer data…"):
+                peer_rows = fetch_peer_metrics(all_peer_symbols)
+            if peer_rows:
+                peer_df = pd.DataFrame(peer_rows)
+                def _highlight_self(row):
+                    return ["font-weight: bold; background-color: rgba(99,102,241,0.15)" if row["Symbol"] == symbol_input else "" for _ in row]
+                st.dataframe(
+                    peer_df.style.apply(_highlight_self, axis=1),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("Could not fetch peer data.")
+        else:
+            st.caption("No peers found in the same sector within the universe.")
+
     st.divider()
 
     with st.expander("📄 Raw Info (all fields)"):
@@ -1452,6 +1716,27 @@ def _save_notes(notes):
         pass
 
 
+_ALERTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "price_alerts.json")
+
+
+def _load_alerts():
+    try:
+        if os.path.exists(_ALERTS_FILE):
+            with open(_ALERTS_FILE, "r") as f:
+                return _json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_alerts(alerts):
+    try:
+        with open(_ALERTS_FILE, "w") as f:
+            _json.dump(alerts, f)
+    except Exception:
+        pass
+
+
 def _load_screener_cache(cache_file=None):
     cf = cache_file or _SCREENER_CACHE_FILE
     try:
@@ -1693,6 +1978,18 @@ def render_screener(universe=None, label="all"):
     st.markdown("## 📊 All Candidates — Ranked by Score")
     st.caption("📝 Notes are editable here and saved to disk automatically")
     all_sorted = df.sort_values("Score", ascending=False)
+
+    # CSV export
+    export_df = _build_screener_df(all_sorted)
+    csv_bytes = export_df.drop(columns=["Notes"], errors="ignore").to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇ Export CSV",
+        data=csv_bytes,
+        file_name=f"screener_{label}.csv",
+        mime="text/csv",
+        key=f"csv_export_{label}",
+    )
+
     _show_screener_table(all_sorted, key=f"screener_all_{label}", height=900, show_notes=True)
 
     # ── Score legend ──
@@ -1707,6 +2004,143 @@ def render_screener(universe=None, label="all"):
         "RSI: OB = Overbought (>70) · OS = Oversold (<30) · OK = Neutral  |  "
         "MACD: Bullish = MACD above signal line  |  Not financial advice."
     )
+
+
+# ─── Market overview tab ──────────────────────────────────────────────────────
+
+def render_market_tab():
+    st.subheader("Macro Overview")
+    macro = fetch_macro_snapshot()
+    if macro:
+        cols = st.columns(len(macro))
+        for col, (name, data) in zip(cols, macro.items()):
+            chg = data.get("change", 0) or 0
+            arrow = "▲" if chg >= 0 else "▼"
+            color = "#22c55e" if chg >= 0 else "#ef4444"
+            col.markdown(
+                f"**{name}**<br>"
+                f"<span style='font-size:1.1rem'>{data.get('price', 'N/A')}</span><br>"
+                f"<span style='color:{color}'>{arrow} {chg:+.2f}%</span>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("Could not load macro data.")
+
+    st.divider()
+    st.subheader("Sector Performance (1-Day)")
+    sector_data = fetch_sector_returns()
+    if sector_data:
+        names = list(sector_data.keys())
+        values = [sector_data[n] for n in names]
+        colors = ["#22c55e" if v >= 0 else "#ef4444" for v in values]
+        fig_sector = go.Figure(go.Bar(
+            x=names, y=values,
+            marker_color=colors,
+            text=[f"{v:+.2f}%" for v in values],
+            textposition="outside",
+        ))
+        fig_sector.update_layout(
+            yaxis_title="1-Day Return (%)",
+            height=360,
+            margin=dict(t=20, b=20),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+        fig_sector.update_yaxes(zeroline=True, zerolinecolor="#888")
+        st.plotly_chart(fig_sector, use_container_width=True)
+
+        # Heat-map grid (colored tiles)
+        st.markdown("**Sector Heat Map**")
+        tile_cols = st.columns(4)
+        for i, (name, val) in enumerate(sector_data.items()):
+            col = tile_cols[i % 4]
+            bg = f"rgba(34,197,94,{min(abs(val)/3, 1):.2f})" if val >= 0 else f"rgba(239,68,68,{min(abs(val)/3, 1):.2f})"
+            col.markdown(
+                f"<div style='background:{bg};border-radius:6px;padding:8px 10px;margin-bottom:6px;text-align:center'>"
+                f"<b>{name}</b><br><span style='font-size:1.05rem'>{val:+.2f}%</span></div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("Could not load sector data.")
+
+
+# ─── Alerts tab ───────────────────────────────────────────────────────────────
+
+def render_alerts_tab():
+    st.subheader("Price Alerts")
+    alerts = _load_alerts()
+
+    # ── Add new alert ─────────────────────────────────────────────────────────
+    with st.expander("➕ Add Alert", expanded=not alerts):
+        a1, a2, a3, a4 = st.columns([2, 2, 2, 1])
+        new_sym   = a1.text_input("Ticker", placeholder="e.g. AAPL", key="alert_sym").strip().upper()
+        direction = a2.selectbox("Condition", ["Above", "Below"], key="alert_dir")
+        new_price = a3.number_input("Price ($)", min_value=0.01, step=0.01, format="%.2f", key="alert_price")
+        a4.markdown("<br>", unsafe_allow_html=True)
+        if a4.button("Add", type="primary", key="alert_add"):
+            if new_sym and new_price > 0:
+                alerts.append({"symbol": new_sym, "direction": direction, "price": new_price, "triggered": False})
+                _save_alerts(alerts)
+                st.success(f"Alert added: {new_sym} {direction.lower()} ${new_price:.2f}")
+                st.rerun()
+            else:
+                st.warning("Enter a ticker and target price.")
+
+    if not alerts:
+        st.info("No alerts set. Add one above.")
+        return
+
+    # ── Check current prices against alerts ──────────────────────────────────
+    unique_syms = list({a["symbol"] for a in alerts})
+    prices: dict[str, float] = {}
+    for sym in unique_syms:
+        try:
+            info_a, *_ = fetch_data(sym)
+            p = safe_float(info_a.get("currentPrice") or info_a.get("regularMarketPrice")) if info_a else None
+            if p:
+                prices[sym] = p
+        except Exception:
+            pass
+
+    triggered_any = False
+    for a in alerts:
+        sym = a["symbol"]
+        cur = prices.get(sym)
+        if cur is None:
+            continue
+        hit = (a["direction"] == "Above" and cur >= a["price"]) or \
+              (a["direction"] == "Below" and cur <= a["price"])
+        if hit and not a.get("triggered"):
+            a["triggered"] = True
+            triggered_any = True
+    if triggered_any:
+        _save_alerts(alerts)
+
+    # ── Render alerts table ───────────────────────────────────────────────────
+    st.markdown(f"**{len(alerts)} alert(s)**")
+    to_delete = None
+    for i, a in enumerate(alerts):
+        sym   = a["symbol"]
+        cur   = prices.get(sym)
+        hit   = a.get("triggered", False)
+        row   = st.columns([2, 2, 2, 2, 1])
+        status = "🔔 **TRIGGERED**" if hit else "⏳ Watching"
+        row[0].markdown(f"**{sym}**")
+        row[1].markdown(f"{a['direction']} **${a['price']:.2f}**")
+        row[2].markdown(f"Current: **${cur:.2f}**" if cur else "Current: N/A")
+        row[3].markdown(status)
+        if row[4].button("🗑", key=f"del_alert_{i}", help="Delete"):
+            to_delete = i
+    if to_delete is not None:
+        alerts.pop(to_delete)
+        _save_alerts(alerts)
+        st.rerun()
+
+    if any(a.get("triggered") for a in alerts):
+        if st.button("Clear Triggered Alerts", key="clear_triggered"):
+            alerts = [a for a in alerts if not a.get("triggered")]
+            _save_alerts(alerts)
+            st.rerun()
 
 
 # ─── App shell ────────────────────────────────────────────────────────────────
@@ -1732,9 +2166,31 @@ with st.sidebar:
     ).strip().upper()
     st.button("Analyze", type="primary", use_container_width=True, key="single_analyze")
     st.divider()
+
+    # Compact macro overview in sidebar
+    with st.container():
+        st.markdown("**Market Pulse**")
+        macro_sb = fetch_macro_snapshot()
+        KEY_MACRO = ["S&P 500", "NASDAQ", "VIX", "10Y Yield", "USD/INR"]
+        for name in KEY_MACRO:
+            if name in macro_sb:
+                d = macro_sb[name]
+                chg = d.get("change", 0) or 0
+                arrow = "▲" if chg >= 0 else "▼"
+                color = "#22c55e" if chg >= 0 else "#ef4444"
+                st.markdown(
+                    f"<div style='display:flex;justify-content:space-between'>"
+                    f"<span style='color:#999;font-size:0.8rem'>{name}</span>"
+                    f"<span style='color:{color};font-size:0.8rem'>{arrow}{chg:+.1f}%</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+    st.divider()
     st.caption("Data cached 10 min · Moat is a proxy metric · Not financial advice")
 
-tab_single, tab_compare, tab_screener = st.tabs(["Single Stock", "Compare Stocks", "Stock Screener"])
+tab_single, tab_compare, tab_screener, tab_market, tab_alerts = st.tabs(
+    ["Single Stock", "Compare Stocks", "Stock Screener", "🌍 Market", "🔔 Alerts"]
+)
 
 # ── Single Stock tab ──────────────────────────────────────────────────────────
 with tab_single:
@@ -1771,3 +2227,11 @@ with tab_screener:
         render_screener(NON_AI_UNIVERSE, "nonai")
     with st_all:
         render_screener(STOCK_UNIVERSE, "all")
+
+# ── Market tab ────────────────────────────────────────────────────────────────
+with tab_market:
+    render_market_tab()
+
+# ── Alerts tab ────────────────────────────────────────────────────────────────
+with tab_alerts:
+    render_alerts_tab()
